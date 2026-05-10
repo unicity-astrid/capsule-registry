@@ -14,7 +14,7 @@ file = "astrid_capsule_registry.wasm"
 
 [publish]
 "registry.v1.response.*" = { wit = "@unicity-astrid/wit/registry/provider-entry" }
-"registry.v1.active_model_changed" = { wit = "provider-entry" }
+"registry.v1.active_model_changed" = { wit = "@unicity-astrid/wit/registry/provider-entry" }
 "registry.v1.selection.*" = { wit = "TODO" }   # no canonical type yet — selection UI envelope (request/callback)
 
 [subscribe]
