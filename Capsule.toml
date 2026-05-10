@@ -15,15 +15,15 @@ file = "astrid_capsule_registry.wasm"
 [publish]
 "registry.v1.response.*" = { wit = "@unicity-astrid/wit/registry/provider-entry" }
 "registry.v1.active_model_changed" = { wit = "@unicity-astrid/wit/registry/provider-entry" }
-"registry.v1.selection.*" = { wit = "TODO" }   # no canonical type yet — selection UI envelope (request/callback)
+"registry.v1.selection.*" = { wit = "@unicity-astrid/wit/registry/selection-required" }
 
 [subscribe]
 # 3-segment wildcard (covers registry.v1.{any_single_segment})
 "registry.v1.*" = { wit = "TODO" }   # wildcard covers heterogeneous registry inbound topics (get_providers, set_active_model, active_model_changed) — no single canonical type
-"cli.v1.command.execute" = { wit = "TODO" }   # no canonical type yet — CLI command execute envelope
+"cli.v1.command.execute" = { wit = "@unicity-astrid/wit/system/command-execute" }
 # 4-segment exact (topic_matches requires equal segment count, so registry.v1.* does NOT cover this)
-"registry.v1.selection.callback" = { wit = "TODO" }   # no canonical type yet — selection UI callback envelope
-"astrid.v1.capsules_loaded" = { wit = "TODO" }   # no canonical type yet — kernel lifecycle notification envelope
+"registry.v1.selection.callback" = { wit = "@unicity-astrid/wit/registry/selection-callback" }
+"astrid.v1.capsules_loaded" = { wit = "@unicity-astrid/wit/system/capsules-loaded" }
 
 [capabilities]
 uplink = true
