@@ -369,12 +369,12 @@ fn emit_model_selection() {
         })
         .collect();
 
+    // `SystemTime::now()` panics on `wasm32-unknown-unknown`. The
+    // monotonic host clock + a per-capsule atomic counter is enough
+    // for a unique request_id at the resolution we need.
     let request_id = format!(
         "models-{}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
+        astrid_sdk::time::monotonic().as_nanos(),
         REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
 
