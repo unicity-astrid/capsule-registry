@@ -190,8 +190,37 @@ fn handle_get_providers() {
 }
 
 /// Handle a `registry.v1.get_active_model` request.
+///
+/// Registry state (provider list + active model id) is stored in
+/// the capsule's KV, which the kernel scopes by invocation principal.
+/// The `active_model_changed` broadcast at boot only primes the
+/// load-time principal's KV — every other principal arrives with an
+/// empty store and would otherwise see `None` here on first ask,
+/// then the gateway-side caller (react.active_llm_topic) would fall
+/// back to its hardcoded `llm.v1.request.generate.anthropic` topic,
+/// which has no subscriber on a typical LM Studio install.
+///
+/// Detect that case (empty providers OR missing active id) and
+/// re-run the discover + auto-select dance under the invoking
+/// principal. The persisted state ends up keyed to that principal,
+/// so subsequent calls skip the round-trip. Discovery only adds one
+/// 500ms describe-fanout window on first ask per principal.
 fn handle_get_active_model() {
-    let state = load_state();
+    let mut state = load_state();
+
+    if state.providers.is_empty() || state.active_model_id.is_none() {
+        let providers = discover_providers();
+        if !providers.is_empty() {
+            state.providers = providers;
+            save_state(&state);
+        }
+        clear_stale_active_model(&mut state);
+        auto_select_if_single(&mut state);
+        // Re-load so the auto_select_if_single write is reflected
+        // back into the local copy we'll read from below.
+        state = load_state();
+    }
+
     let active = state
         .active_model_id
         .as_ref()
