@@ -208,18 +208,26 @@ fn handle_get_providers() {
 fn handle_get_active_model() {
     let mut state = load_state();
 
-    if state.providers.is_empty() || state.active_model_id.is_none() {
+    // Discover providers only when we have NONE cached. A populated provider
+    // set with no active model selected (multiple providers, none chosen) is a
+    // valid steady state — re-running the ~500ms describe fan-out on every call
+    // just because `active_model_id` is `None` would stall the loop under load
+    // and contradicts the "discover once per principal" contract above.
+    if state.providers.is_empty() {
         let providers = discover_providers();
         if !providers.is_empty() {
             state.providers = providers;
             save_state(&state);
         }
-        clear_stale_active_model(&mut state);
-        auto_select_if_single(&mut state);
-        // Re-load so the auto_select_if_single write is reflected
-        // back into the local copy we'll read from below.
-        state = load_state();
     }
+
+    // Prune a stale active id and auto-select when exactly one provider exists.
+    // Both take `&mut state` and mutate it in place (persisting only when they
+    // actually change something — `auto_select_if_single` is a no-op when a
+    // model is already selected or multiple providers exist), so the local copy
+    // is already current and no reload is needed.
+    clear_stale_active_model(&mut state);
+    auto_select_if_single(&mut state);
 
     let active = state
         .active_model_id
