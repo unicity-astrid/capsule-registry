@@ -14,7 +14,11 @@ file = "astrid_capsule_registry.wasm"
 
 [publish]
 "registry.v1.response.*" = { wit = "@unicity-astrid/wit/registry/provider-entry" }
-"registry.v1.active_model_changed" = { wit = "@unicity-astrid/wit/registry/provider-entry" }
+# Carries a ProviderEntry on a change OR JSON `null` on a clear (see
+# publish_model_cleared / cleared_payload). A null payload does not satisfy the
+# provider-entry schema, so declaring that type would drop the clear event under
+# publish-side WIT enforcement. `opaque` admits both shapes.
+"registry.v1.active_model_changed" = { wit = "opaque" }
 "registry.v1.selection.*" = { wit = "@unicity-astrid/wit/registry/selection-required" }
 # Provider discovery broadcast — provider capsules (openai-compat etc.)
 # subscribe to this and respond on llm.v1.response.describe. Without

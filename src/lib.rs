@@ -42,6 +42,7 @@ mod selection;
 use selection::{
     ReconcileOutcome, RegistryState, authenticate_capsule, auto_select_defaults_in_place,
     is_known_subcommand, models_result, reconcile_active_model_in_place, resolve_selection,
+    subcommand_needs_discovery,
 };
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -72,16 +73,33 @@ const MAX_REQ_ID_LEN: usize = 64;
 /// `req_id` containing a topic separator (`.`) or a wildcard (`*`) would
 /// publish to a topic that does not match that subscription (it would split
 /// into extra segments), so the reply would silently never reach the caller —
-/// or could be steered onto an unrelated topic. We therefore accept only the
-/// shape the CLI actually emits (`Uuid::new_v4().simple()` = lowercase hex),
-/// tolerating the hyphenated UUID form, and reject everything else: a
-/// non-empty run of ASCII alphanumerics and `-`, within a length bound.
+/// or could be steered onto an unrelated topic.
+///
+/// We therefore accept ONLY the exact shape the CLI emits: a `Uuid`, either in
+/// simple form (`Uuid::new_v4().simple()` = 32 lowercase-hex chars) or in
+/// hyphenated form (`8-4-4-4-12` lowercase hex). That is lowercase hex digits
+/// plus `-`, within a length bound. Everything else — uppercase, other ASCII
+/// alphanumerics, `.`, `*`, whitespace, empty, or oversized — is rejected.
 pub(crate) fn is_valid_req_id(req_id: &str) -> bool {
+    fn is_lower_hex_or_hyphen(b: u8) -> bool {
+        b.is_ascii_digit() || matches!(b, b'a'..=b'f') || b == b'-'
+    }
     !req_id.is_empty()
         && req_id.len() <= MAX_REQ_ID_LEN
-        && req_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && req_id.bytes().all(is_lower_hex_or_hyphen)
+}
+
+/// The only `command` this capsule's CLI run topic implements. The run topic
+/// `cli.v1.command.run.registry` is per-capsule, not per-verb, so the payload's
+/// `command` field must be validated against this before its args are treated
+/// as a `models` subcommand.
+const CLI_RUN_COMMAND: &str = "models";
+
+/// Whether a CLI run payload's `command` field names the verb this capsule
+/// implements. Extracted as a pure predicate so the gating decision is
+/// unit-testable without the IO-buried dispatch loop.
+pub(crate) fn is_models_command(payload: &serde_json::Value) -> bool {
+    payload.get("command").and_then(|v| v.as_str()) == Some(CLI_RUN_COMMAND)
 }
 
 /// Time the discovery routine waits for provider capsules to respond
@@ -157,12 +175,29 @@ fn discover_providers() -> Vec<ProviderEntry> {
     }
 
     let mut providers: Vec<ProviderEntry> = Vec::new();
-    // Drain whatever arrives in the window. `recv` blocks up to the
-    // remaining timeout; once we have nothing to read we bail. A single
-    // bounded recv would only see the first responder — we keep polling
-    // until the window closes (signalled by a Timeout error).
-    let mut remaining = DISCOVERY_TIMEOUT_MS;
+    // Drain whatever arrives in the window. `recv` returns as soon as a message
+    // is available (it does NOT block the full step when there's traffic), so we
+    // must bound the loop by REAL elapsed time, not by subtracting the nominal
+    // step per iteration. A burst of provider responses would otherwise return
+    // many early `recv`s, each charging the full `step` against the budget, and
+    // close the window after only a handful of iterations — dropping providers
+    // that respond slightly later. The monotonic clock measures actual elapsed
+    // time (only differences are meaningful; see SDK `time::monotonic`).
+    let start = astrid_sdk::time::monotonic();
+    let budget = DISCOVERY_TIMEOUT_MS;
     loop {
+        let elapsed_ms = u64::try_from(
+            astrid_sdk::time::monotonic()
+                .saturating_sub(start)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let remaining = budget.saturating_sub(elapsed_ms);
+        if remaining == 0 {
+            break;
+        }
+        // Cap each blocking wait so we re-check the deadline periodically even
+        // when no traffic arrives.
         let step = remaining.min(100);
         match response_sub.recv(step) {
             Ok(result) => {
@@ -176,30 +211,30 @@ fn discover_providers() -> Vec<ProviderEntry> {
                 }
             }
             Err(_) => {
-                // Timeout (or other host error) — assume no more arrivals.
+                // Host error (not a plain timeout — the host signals an idle
+                // window with an empty `Ok` envelope, see SDK ipc::recv). Stop
+                // draining; the deadline loop would otherwise spin on the error.
                 break;
             }
-        }
-        remaining = remaining.saturating_sub(step);
-        if remaining == 0 {
-            break;
         }
     }
 
     providers
 }
 
-/// Parse one describe message's `{"providers": [...]}` body, authenticate the
-/// emitting capsule against the kernel-stamped `source_id`, and return the
+/// Parse one describe message's `{"providers": [...]}` body and return its
 /// entries with canonical `"<capsule>:<model>"` ids in the provider's emit
-/// order (entry[0] = that capsule's default hint).
+/// order (entry[0] = that capsule's default hint). Each entry is authenticated
+/// INDIVIDUALLY: its own `request_topic` suffix is the `<capsule>` candidate,
+/// which must stamp (UUIDv5) to the message's kernel-stamped `source_id`. There
+/// is no separate per-message candidate — a provider may not smuggle in entries
+/// routed to a capsule it does not own.
 ///
-/// Entries are dropped (with a warning) when:
-/// - the payload is malformed or has no `providers` array,
-/// - the `<capsule>` candidate derived from `request_topic` does not
-///   authenticate against `source_id` (anti-shadowing),
-/// - an entry's own `request_topic` suffix disagrees with the authenticated
-///   candidate (a provider may not smuggle entries it does not own).
+/// A malformed payload, or one with no `providers` array, returns empty
+/// SILENTLY (no warning) — it is treated as "this message carried no
+/// providers". Only a PER-ENTRY authentication failure is dropped WITH a
+/// warning (anti-shadowing). An entry whose JSON does not deserialize into a
+/// `ProviderEntry` is skipped silently.
 ///
 /// The `<model>` half of the canonical id is the provider-reported entry
 /// `id`. Against today's single-entry providers that is the bare provider
@@ -549,6 +584,20 @@ fn dispatch_cli_run_messages(result: &ipc::PollResult) {
             ));
             continue;
         }
+        // The run topic `cli.v1.command.run.registry` is per-CAPSULE, not
+        // per-verb: every `astrid capsule <verb>` the registry declares lands
+        // here. We only implement `models`, so reject any other `command` rather
+        // than treating its args as a models subcommand.
+        if !is_models_command(&payload) {
+            let command = payload
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            log::warn(format!(
+                "registry: dropping cli run for unsupported command '{command}'"
+            ));
+            continue;
+        }
         let args: Vec<String> = payload
             .get("args")
             .and_then(|v| v.as_array())
@@ -569,17 +618,22 @@ fn dispatch_cli_run_messages(result: &ipc::PollResult) {
             continue;
         }
 
-        // Discover/cache providers so `list`/`current`/`set` see entries even
-        // on a fresh principal (mirrors the other handlers).
+        // Discover/cache providers so `list`/`current --json`/`set <id>` see
+        // entries even on a fresh principal (mirrors the other handlers). Skip
+        // the ~500ms fan-out for subcommands whose reply can't depend on
+        // discovered entries (`unset`, `set` with no id, `current` without
+        // `--json`) so they return promptly.
         let mut state = load_state();
-        if state.providers.is_empty() {
+        if subcommand_needs_discovery(&args) && state.providers.is_empty() {
             let providers = discover_providers();
             if !providers.is_empty() {
                 state.providers = providers;
                 save_state(&state);
             }
         }
-        // Heal a stale binding before reporting/using `active`.
+        // Heal a stale binding before reporting/using `active`. With empty
+        // providers (discovery skipped) this is a no-op, so the stored binding
+        // is preserved.
         reconcile_active_model(&mut state);
 
         let body = models_result(&args, &state.providers, state.active_model_id.as_deref());
@@ -797,10 +851,11 @@ mod tests {
         assert_ne!(payload, changed);
     }
 
-    /// `req_id` is interpolated into the result topic; only the single-segment
-    /// shape the CLI actually sends may pass. Anything carrying a topic
-    /// separator (`.`), a wildcard (`*`), whitespace, or that is empty/oversized
-    /// must be rejected so we never publish to a derived, unexpected topic.
+    /// `req_id` is interpolated into the result topic; only the exact UUID shape
+    /// the CLI actually sends (lowercase hex, simple or hyphenated) may pass.
+    /// Anything carrying a topic separator (`.`), a wildcard (`*`), whitespace,
+    /// uppercase, non-hex letters, or that is empty/oversized must be rejected so
+    /// we never publish to a derived, unexpected topic.
     #[test]
     fn req_id_validation_accepts_cli_shape_rejects_topic_injection() {
         // The exact shape the CLI emits: `Uuid::new_v4().simple()` (32 hex).
@@ -819,6 +874,32 @@ mod tests {
         assert!(!is_valid_req_id(""));
         // Oversized values are bounded out.
         assert!(!is_valid_req_id(&"a".repeat(MAX_REQ_ID_LEN + 1)));
+        // Uppercase hex is NOT the CLI shape (`Uuid::simple()` is lowercase).
+        assert!(!is_valid_req_id("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(!is_valid_req_id("01234567-89AB-CDEF-0123-456789ABCDEF"));
+        // Non-hex ASCII alphanumerics must be rejected (formerly accepted).
+        assert!(!is_valid_req_id("zzzzzzzz"));
+        assert!(!is_valid_req_id("0123456789abcdefg"));
+    }
+
+    /// The CLI run topic `cli.v1.command.run.registry` is per-capsule, not
+    /// per-verb. Only a payload whose `command` is `"models"` may be dispatched
+    /// as a models subcommand; any other command (or a missing/non-string
+    /// field) must be rejected so unrelated verbs aren't misinterpreted as
+    /// `models` args.
+    #[test]
+    fn cli_run_accepts_only_models_command() {
+        assert!(is_models_command(
+            &serde_json::json!({"command": "models", "args": ["list"]})
+        ));
+        // A different verb routed to this per-capsule topic is rejected.
+        assert!(!is_models_command(
+            &serde_json::json!({"command": "providers", "args": ["list"]})
+        ));
+        // Missing `command` is rejected (don't treat args as a models subcommand).
+        assert!(!is_models_command(&serde_json::json!({"args": ["list"]})));
+        // A non-string `command` is rejected.
+        assert!(!is_models_command(&serde_json::json!({"command": 42})));
     }
 
     fn test_entry() -> ProviderEntry {

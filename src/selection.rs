@@ -40,6 +40,31 @@ pub(crate) fn is_known_subcommand(sub: &str) -> bool {
     matches!(sub, SUB_LIST | SUB_CURRENT | SUB_SET | SUB_UNSET)
 }
 
+/// Whether a `models` run needs the ~500ms provider-discovery fan-out to build
+/// its reply, given the full `args` (subcommand + flags). Skipping discovery
+/// when it can't affect the answer avoids stalling the dispatch loop:
+///
+/// - `list` and `current --json` enumerate / look up entries → need discovery.
+/// - `set <id>` resolves the id against entries → needs discovery.
+/// - `set` (missing id) replies with a usage error, independent of entries.
+/// - `unset` clears the stored binding and replies a fixed string.
+/// - `current` (no `--json`) reports only the stored `active_model_id` string.
+///
+/// The last three never consult discovered entries, so they short-circuit the
+/// fan-out. (An unknown subcommand is already rejected upstream.)
+pub(crate) fn subcommand_needs_discovery(args: &[String]) -> bool {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let wants_json = args.iter().any(|a| a == "--json");
+    match sub {
+        SUB_LIST => true,
+        SUB_CURRENT => wants_json,
+        // `set` needs discovery only when an id is actually present to resolve.
+        SUB_SET => args.get(1).is_some(),
+        SUB_UNSET => false,
+        _ => false,
+    }
+}
+
 /// The persisted registry state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct RegistryState {
@@ -95,9 +120,10 @@ impl ResolveError {
 ///    it binds immediately — a canonical id is unique by construction and
 ///    always wins, even when another entry's *bare* model happens to equal
 ///    the same string.
-/// 1. **Exact pass (no splitting).** An entry binds when its canonical `id`
-///    equals `input`, OR its bare model (`id` after the first `':'`) equals
-///    `input`. One match binds; several -> `Ambiguous` (the qualified ids).
+/// 1. **Bare pass (no splitting).** An entry binds when its bare model (`id`
+///    after the first `':'`) equals `input`. (The exact canonical `id == input`
+///    case is already covered by Pass 0.) One match binds; several ->
+///    `Ambiguous` (the qualified ids).
 /// 2. **Qualified pass** (only when the exact pass found nothing AND `input`
 ///    contains `':'`): treat `input` as `"<capsule>:<model>"` split on the
 ///    FIRST `':'`, and match entries whose qualifier and bare model both
@@ -115,10 +141,12 @@ pub(crate) fn resolve_selection<'a>(
         return Ok(exact);
     }
 
-    // Pass 1: exact canonical-or-bare, no splitting.
+    // Pass 1: bare-model match, no splitting. The exact canonical `id == input`
+    // case is already handled by the Pass 0 short-circuit above, so this filter
+    // only needs the bare-model check.
     let exact: Vec<&ProviderEntry> = entries
         .iter()
-        .filter(|e| e.id == input || bare_model_of(&e.id) == input)
+        .filter(|e| bare_model_of(&e.id) == input)
         .collect();
     match exact.as_slice() {
         [one] => return Ok(one),
@@ -214,6 +242,15 @@ pub(crate) fn reconcile_active_model_in_place(state: &mut RegistryState) -> Reco
     let Some(id) = state.active_model_id.clone() else {
         return ReconcileOutcome::Unchanged;
     };
+
+    // No providers means discovery has not run yet OR transiently failed — we
+    // CANNOT judge staleness without entries to compare against. Clearing here
+    // would permanently wipe a valid selection on a single empty discovery
+    // window. Leave the stored binding untouched; the next run with a populated
+    // provider set reconciles it.
+    if state.providers.is_empty() {
+        return ReconcileOutcome::Unchanged;
+    }
 
     // Already resolves by exact canonical match — nothing to do.
     if state.providers.iter().any(|p| p.id == id) {
@@ -497,6 +534,25 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_keeps_selection_when_providers_empty() {
+        // Discovery has not run yet OR transiently failed — providers is empty.
+        // Reconcile MUST NOT clear a valid stored selection: it cannot judge
+        // staleness with nothing to compare against, and clearing here would
+        // permanently wipe the binding on a single empty discovery window.
+        let mut state = RegistryState {
+            providers: vec![],
+            active_model_id: Some("openai-compat:gpt-4o".to_string()),
+        };
+        let outcome = reconcile_active_model_in_place(&mut state);
+        assert_eq!(outcome, ReconcileOutcome::Unchanged);
+        assert_eq!(
+            state.active_model_id.as_deref(),
+            Some("openai-compat:gpt-4o"),
+            "selection must survive an empty-provider reconcile"
+        );
+    }
+
+    #[test]
     fn self_heal_clears_genuinely_gone() {
         let mut state = RegistryState {
             providers: vec![entry("openai-compat:gpt-4o")],
@@ -571,6 +627,22 @@ mod tests {
                 .expect("error string")
                 .contains("unknown model")
         );
+    }
+
+    #[test]
+    fn discovery_skipped_for_entry_independent_subcommands() {
+        let a = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Need discovery: enumerate / look up / resolve against entries.
+        assert!(subcommand_needs_discovery(&a(&["list"])));
+        assert!(subcommand_needs_discovery(&a(&["list", "--json"])));
+        assert!(subcommand_needs_discovery(&a(&["current", "--json"])));
+        assert!(subcommand_needs_discovery(&a(&["set", "gpt-5.4"])));
+
+        // Skip discovery: reply is independent of discovered entries.
+        assert!(!subcommand_needs_discovery(&a(&["unset"])));
+        assert!(!subcommand_needs_discovery(&a(&["set"]))); // missing id -> usage error
+        assert!(!subcommand_needs_discovery(&a(&["current"]))); // stored id string only
     }
 
     #[test]
