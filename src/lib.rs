@@ -18,7 +18,8 @@
 //! - `registry.v1.set_active_model` — payload: `{"model_id": "..."}`, sets active model
 //!
 //! **Events** (published by registry):
-//! - `registry.v1.active_model_changed` — payload: `ProviderEntry`, emitted on model change
+//! - `registry.v1.active_model_changed` — payload: `ProviderEntry` on a model
+//!   change, or JSON `null` when the active model is cleared
 //!
 //! **Provider discovery** (capsule-to-capsule IPC, replaces the
 //! removed `hooks::trigger` fan-out):
@@ -220,6 +221,22 @@ fn publish_model_changed(provider: &ProviderEntry) {
     let _ = ipc::publish_json("registry.v1.active_model_changed", provider);
 }
 
+/// The payload broadcast when the active model is *cleared*. A normal change
+/// carries the new `ProviderEntry`; a clear carries JSON `null`, signalling
+/// "no active model" so warm-cache subscribers (react) drop the stale binding
+/// instead of routing to it until their next lazy fetch.
+fn cleared_payload() -> serde_json::Value {
+    serde_json::Value::Null
+}
+
+/// Publish the active-model-cleared event on the same `active_model_changed`
+/// topic with a `null` payload (see [`cleared_payload`]). Without this,
+/// clearing the selection persists silently and downstream keeps using the
+/// last-known model until it happens to re-fetch.
+fn publish_model_cleared() {
+    let _ = ipc::publish_json("registry.v1.active_model_changed", &cleared_payload());
+}
+
 /// Handle a `registry.v1.get_providers` request.
 fn handle_get_providers() {
     let providers = discover_providers();
@@ -362,6 +379,7 @@ fn reconcile_active_model(state: &mut RegistryState) {
                 "Active model '{from}' no longer available after reload, clearing"
             ));
             save_state(state);
+            publish_model_cleared();
         }
     }
 }
@@ -486,6 +504,7 @@ fn dispatch_cli_run_messages(result: &ipc::PollResult) {
                 if state.active_model_id.is_some() {
                     state.active_model_id = None;
                     save_state(&state);
+                    publish_model_cleared();
                 }
             }
             _ => {}
@@ -648,5 +667,37 @@ impl Registry {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The clear path must broadcast a distinguishable "no active model"
+    /// payload on `registry.v1.active_model_changed` so warm-cache
+    /// subscribers (react) drop the stale binding instead of routing to it.
+    /// The publish itself is IO-buried in `ipc::publish_json`, so we assert
+    /// the extracted payload shape: JSON `null`, never a `ProviderEntry`
+    /// object. A subscriber can therefore tell a clear from a change.
+    #[test]
+    fn cleared_payload_is_null() {
+        let payload = cleared_payload();
+        assert!(payload.is_null(), "clear must broadcast JSON null");
+
+        // And it is genuinely distinguishable from a real model-changed
+        // payload, which serializes to a JSON object.
+        let entry = ProviderEntry {
+            id: "openai-compat:gpt-5.4".to_string(),
+            description: "test".to_string(),
+            request_topic: "llm.v1.request.generate.openai-compat".to_string(),
+            stream_topic: "llm.v1.stream.openai-compat".to_string(),
+            capabilities: vec!["text".to_string()],
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+        };
+        let changed = serde_json::to_value(&entry).expect("serialize entry");
+        assert!(changed.is_object(), "a real change serializes to an object");
+        assert_ne!(payload, changed);
     }
 }

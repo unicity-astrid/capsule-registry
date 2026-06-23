@@ -75,10 +75,13 @@ impl ResolveError {
 /// Each entry `id` is canonical `"<capsule>:<model>"`. The colon is NOT a
 /// reliable separator (ollama models embed colons), so we match structurally:
 ///
+/// 0. **Exact canonical pass.** If any entry's canonical `id` equals `input`,
+///    it binds immediately — a canonical id is unique by construction and
+///    always wins, even when another entry's *bare* model happens to equal
+///    the same string.
 /// 1. **Exact pass (no splitting).** An entry binds when its canonical `id`
 ///    equals `input`, OR its bare model (`id` after the first `':'`) equals
 ///    `input`. One match binds; several -> `Ambiguous` (the qualified ids).
-///    A unique exact canonical match is, by construction, the only match.
 /// 2. **Qualified pass** (only when the exact pass found nothing AND `input`
 ///    contains `':'`): treat `input` as `"<capsule>:<model>"` split on the
 ///    FIRST `':'`, and match entries whose qualifier and bare model both
@@ -88,6 +91,14 @@ pub(crate) fn resolve_selection<'a>(
     input: &str,
     entries: &'a [ProviderEntry],
 ) -> Result<&'a ProviderEntry, ResolveError> {
+    // Pass 0: an exact canonical id is unique by construction and always
+    // wins. Short-circuit before the combined filter below, otherwise an
+    // input that *is* a canonical id can be dragged into `Ambiguous` when a
+    // second entry's bare model happens to equal that same string.
+    if let Some(exact) = entries.iter().find(|e| e.id == input) {
+        return Ok(exact);
+    }
+
     // Pass 1: exact canonical-or-bare, no splitting.
     let exact: Vec<&ProviderEntry> = entries
         .iter()
@@ -345,6 +356,21 @@ mod tests {
     #[test]
     fn resolve_exact_canonical_wins() {
         let entries = vec![entry("openai-compat:gpt-5.4"), entry("openai:o3")];
+        let got = resolve_selection("openai-compat:gpt-5.4", &entries).expect("binds");
+        assert_eq!(got.id, "openai-compat:gpt-5.4");
+    }
+
+    #[test]
+    fn resolve_exact_canonical_beats_colliding_bare() {
+        // The first entry's canonical id IS the input. The second entry's bare
+        // model (`id` after the first colon) ALSO equals the input. The exact
+        // canonical match must win and bind the first entry uniquely — without
+        // the Pass 0 short-circuit the combined filter would collect both and
+        // return `Ambiguous`.
+        let entries = vec![
+            entry("openai-compat:gpt-5.4"),
+            entry("other:openai-compat:gpt-5.4"),
+        ];
         let got = resolve_selection("openai-compat:gpt-5.4", &entries).expect("binds");
         assert_eq!(got.id, "openai-compat:gpt-5.4");
     }
