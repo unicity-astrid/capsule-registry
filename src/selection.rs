@@ -1,0 +1,524 @@
+//! Pure model-selection logic: canonical id handling, source-stamp
+//! authentication, the ollama-safe resolver, and the reconcile/auto-select
+//! decisions. None of this touches the host — `lib.rs` owns IPC/KV and wraps
+//! the decisions here with persistence + event publishing. Keeping the logic
+//! host-free is what lets it carry its own `#[cfg(test)]` units (capsule test
+//! binaries run on the developer host, not in the wasm sandbox).
+
+use astrid_sdk::contracts::registry::ProviderEntry;
+
+/// Namespace UUID the kernel uses to stamp every capsule's IPC `source_id`
+/// as a deterministic UUIDv5 of its package name. This MUST stay in lockstep
+/// with the kernel constant (`astrid` `crates/astrid-capsule/src/engine/wasm/mod.rs`,
+/// `CAPSULE_ID_NAMESPACE`), which is documented there as "must never change"
+/// because changing it would re-identify every capsule fleet-wide.
+///
+/// We duplicate it here so the registry can authenticate a provider's
+/// self-reported `<capsule>` qualifier: UUIDv5 is one-way, so we cannot
+/// decode a name from a `source_id` — instead we recompute the stamp for a
+/// candidate name and require it to equal the authenticated `source_id`.
+const CAPSULE_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
+
+/// Fixed prefix of a provider's request topic. The trailing segment after
+/// this prefix is the candidate `<capsule>` qualifier we authenticate.
+const LLM_REQUEST_GENERATE_PREFIX: &str = "llm.v1.request.generate.";
+
+/// The persisted registry state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub(crate) struct RegistryState {
+    pub(crate) providers: Vec<ProviderEntry>,
+    pub(crate) active_model_id: Option<String>,
+}
+
+/// The `<capsule>` qualifier of a canonical `"<capsule>:<model>"` id —
+/// everything before the FIRST `':'`. Returns the whole string when there
+/// is no colon (degenerate/old-form ids).
+pub(crate) fn qualifier_of(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(cap, _)| cap)
+}
+
+/// The bare model of a canonical `"<capsule>:<model>"` id — everything after
+/// the FIRST `':'`. ollama model names contain colons
+/// (`"ollama:llama3.3:70b"` -> `"llama3.3:70b"`), so we only ever split on
+/// the first separator and keep the remainder verbatim. Returns the whole
+/// string when there is no colon.
+pub(crate) fn bare_model_of(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(_, model)| model)
+}
+
+/// Why a selection input failed to bind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolveError {
+    /// The input matched no entry.
+    Unknown { input: String },
+    /// The input matched more than one entry; carries the qualified
+    /// candidate ids so the operator-facing surface can echo them.
+    Ambiguous { candidates: Vec<String> },
+}
+
+impl ResolveError {
+    /// Render for the CLI/IPC error surface (the ambiguous list is echoed so
+    /// the operator can disambiguate with a qualified id).
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Unknown { input } => format!("unknown model: {input}"),
+            Self::Ambiguous { candidates } => {
+                format!("ambiguous model; candidates: {}", candidates.join(", "))
+            }
+        }
+    }
+}
+
+/// Resolve an operator selection `input` against canonical entries.
+///
+/// Each entry `id` is canonical `"<capsule>:<model>"`. The colon is NOT a
+/// reliable separator (ollama models embed colons), so we match structurally:
+///
+/// 1. **Exact pass (no splitting).** An entry binds when its canonical `id`
+///    equals `input`, OR its bare model (`id` after the first `':'`) equals
+///    `input`. One match binds; several -> `Ambiguous` (the qualified ids).
+///    A unique exact canonical match is, by construction, the only match.
+/// 2. **Qualified pass** (only when the exact pass found nothing AND `input`
+///    contains `':'`): treat `input` as `"<capsule>:<model>"` split on the
+///    FIRST `':'`, and match entries whose qualifier and bare model both
+///    equal those halves. One binds; zero -> `Unknown`; several -> `Ambiguous`.
+/// 3. Otherwise `Unknown`.
+pub(crate) fn resolve_selection<'a>(
+    input: &str,
+    entries: &'a [ProviderEntry],
+) -> Result<&'a ProviderEntry, ResolveError> {
+    // Pass 1: exact canonical-or-bare, no splitting.
+    let exact: Vec<&ProviderEntry> = entries
+        .iter()
+        .filter(|e| e.id == input || bare_model_of(&e.id) == input)
+        .collect();
+    match exact.as_slice() {
+        [one] => return Ok(one),
+        [] => {}
+        many => {
+            return Err(ResolveError::Ambiguous {
+                candidates: many.iter().map(|e| e.id.clone()).collect(),
+            });
+        }
+    }
+
+    // Pass 2: qualified, only when the exact pass found nothing and the input
+    // carries a separator. Split on the FIRST colon so an ollama model
+    // (`"ollama:llama3.3:70b"`) keeps its embedded colons in the model half.
+    if let Some((cap, model)) = input.split_once(':') {
+        let qualified: Vec<&ProviderEntry> = entries
+            .iter()
+            .filter(|e| qualifier_of(&e.id) == cap && bare_model_of(&e.id) == model)
+            .collect();
+        match qualified.as_slice() {
+            [one] => return Ok(one),
+            [] => {}
+            many => {
+                return Err(ResolveError::Ambiguous {
+                    candidates: many.iter().map(|e| e.id.clone()).collect(),
+                });
+            }
+        }
+    }
+
+    Err(ResolveError::Unknown {
+        input: input.to_string(),
+    })
+}
+
+/// Authenticate a provider's self-reported `<capsule>` qualifier against the
+/// kernel-stamped `source_id`.
+///
+/// The provider self-reports its routing as
+/// `request_topic = "llm.v1.request.generate.<capsule>"`; the trailing
+/// segment is an UNTRUSTED candidate. UUIDv5 is one-way, so we cannot decode
+/// the name from `source_id`. Instead we recompute the stamp
+/// `uuid_v5(CAPSULE_ID_NAMESPACE, candidate)` and require it to equal the
+/// authenticated `source_id`. Only then is the candidate trusted as the
+/// qualifier — this is the anti-shadowing guard: a capsule's `source_id` is
+/// fixed by the kernel from its own package name, so it cannot forge another
+/// capsule's qualifier.
+///
+/// Returns the trusted `<capsule>` qualifier, or `None` when the candidate
+/// does not authenticate (caller drops + warns).
+pub(crate) fn authenticate_capsule<'a>(request_topic: &'a str, source_id: &str) -> Option<&'a str> {
+    let candidate = request_topic.strip_prefix(LLM_REQUEST_GENERATE_PREFIX)?;
+    if candidate.is_empty() {
+        return None;
+    }
+    let expected = uuid::Uuid::new_v5(&CAPSULE_ID_NAMESPACE, candidate.as_bytes());
+    (expected.to_string() == source_id).then_some(candidate)
+}
+
+/// What a reconcile decided to do with a stored `active_model_id`. Returned by
+/// the pure [`reconcile_active_model_in_place`] so the host wrapper knows
+/// whether to persist + which event (if any) to publish, and so the decision
+/// is unit-testable without touching the host.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ReconcileOutcome {
+    /// Stored id still resolves (or was already `None`); no change.
+    Unchanged,
+    /// Stored bare provider-id form was remapped to a capsule default.
+    Remapped { from: String, to: ProviderEntry },
+    /// Stored id is genuinely gone; cleared to `None`.
+    Cleared { from: String },
+}
+
+/// Pure core of `reconcile_active_model`: mutates `state.active_model_id` in
+/// memory and reports what it did. No host calls — testable against an
+/// in-memory `RegistryState`.
+///
+/// - **Remap** when the stored id is the OLD bare provider-id form (e.g.
+///   `"openai-compat"`) and some discovered entry's `<capsule>` qualifier
+///   equals it — bind that capsule's DEFAULT model, which by the cross-capsule
+///   ordering convention is the FIRST entry in that capsule's group. This
+///   preserves the principal's binding across a single->multi upgrade instead
+///   of dropping it.
+/// - **Clear** only when no entry matches and the stored id is not a
+///   recognizable capsule qualifier (the model is genuinely gone).
+pub(crate) fn reconcile_active_model_in_place(state: &mut RegistryState) -> ReconcileOutcome {
+    let Some(id) = state.active_model_id.clone() else {
+        return ReconcileOutcome::Unchanged;
+    };
+
+    // Already resolves by exact canonical match — nothing to do.
+    if state.providers.iter().any(|p| p.id == id) {
+        return ReconcileOutcome::Unchanged;
+    }
+
+    // Remap: the stored id is the old bare provider-id form and matches some
+    // capsule's qualifier. Bind that capsule's default = its first entry in
+    // emit order (entries are stored per-capsule, entry[0]-first).
+    if let Some(default) = state
+        .providers
+        .iter()
+        .find(|p| qualifier_of(&p.id) == id)
+        .cloned()
+    {
+        state.active_model_id = Some(default.id.clone());
+        return ReconcileOutcome::Remapped {
+            from: id,
+            to: default,
+        };
+    }
+
+    // Genuinely gone — clear.
+    state.active_model_id = None;
+    ReconcileOutcome::Cleared { from: id }
+}
+
+/// Pure core of `auto_select_defaults`: mutates `state.active_model_id` in
+/// memory and returns the selected entry (or `None` if nothing changed). No
+/// host calls — testable against an in-memory `RegistryState`.
+///
+/// Entries are stored in per-capsule, entry[0]-first order, so `providers[0]`
+/// is the first-discovered capsule's default-hint model. Replaces the old
+/// `len == 1` gate, which never fired once any provider emitted multiple
+/// entries. Discovery order is not authority-ranked, so any deterministic
+/// choice is acceptable for an *initial* auto-select; the operator overrides
+/// via `models set`. The contract that matters: a fresh principal lands on a
+/// resolvable, default-hint model rather than `None`.
+pub(crate) fn auto_select_defaults_in_place(state: &mut RegistryState) -> Option<ProviderEntry> {
+    if state.active_model_id.is_some() {
+        return None;
+    }
+    let provider = state.providers.first().cloned()?;
+    state.active_model_id = Some(provider.id.clone());
+    Some(provider)
+}
+
+/// Serialize one entry for the machine-readable `--json` output. Mirrors the
+/// canonical `ProviderEntry` shape with the now-canonical `id`.
+fn entry_to_json(e: &ProviderEntry) -> serde_json::Value {
+    serde_json::json!({
+        "id": e.id,
+        "description": e.description,
+        "request_topic": e.request_topic,
+        "stream_topic": e.stream_topic,
+        "capabilities": e.capabilities,
+        "context_window": e.context_window,
+        "max_output_tokens": e.max_output_tokens,
+    })
+}
+
+/// Render a human-readable `list` table, marking the active entry with `*`.
+fn render_list_table(entries: &[ProviderEntry], active: Option<&str>) -> String {
+    if entries.is_empty() {
+        return "No LLM models available".to_string();
+    }
+    let mut out = String::new();
+    for e in entries {
+        let marker = if active == Some(e.id.as_str()) {
+            "* "
+        } else {
+            "  "
+        };
+        out.push_str(&format!("{marker}{}  {}\n", e.id, e.description));
+    }
+    // Trim the trailing newline so the CLI doesn't print a blank line.
+    out.pop();
+    out
+}
+
+/// Build the CLI `{ exit_code, output, error? }` result body for a `models`
+/// run, with NO IPC or KV access — the dispatch wrapper supplies `entries`
+/// (from discovery) and `active`, then publishes whatever this returns. Kept
+/// pure so the body shape is unit-testable.
+///
+/// `args[0]` selects the subcommand: `list [--json]`, `current [--json]`,
+/// `set <id>`, `unset`. `set`/`unset` mutate state in the wrapper; here they
+/// only validate input and SHAPE the reply — `set` resolves against `entries`
+/// so the success/failure body (and the canonical id it confirms) is testable.
+pub(crate) fn models_result(
+    args: &[String],
+    entries: &[ProviderEntry],
+    active: Option<&str>,
+) -> serde_json::Value {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let wants_json = args.iter().any(|a| a == "--json");
+
+    match sub {
+        "list" => {
+            if wants_json {
+                let arr: Vec<serde_json::Value> = entries.iter().map(entry_to_json).collect();
+                ok_output(serde_json::Value::Array(arr).to_string())
+            } else {
+                ok_output(render_list_table(entries, active))
+            }
+        }
+        "current" => {
+            if wants_json {
+                let entry = active.and_then(|id| entries.iter().find(|e| e.id == id));
+                let body = serde_json::json!({ "active": entry.map(entry_to_json) });
+                ok_output(body.to_string())
+            } else {
+                ok_output(active.unwrap_or("none").to_string())
+            }
+        }
+        "set" => {
+            let Some(input) = args.get(1) else {
+                return err_output("usage: models set <id>".to_string());
+            };
+            match resolve_selection(input, entries) {
+                Ok(entry) => ok_output(format!("active model set to {}", entry.id)),
+                Err(e) => err_output(e.message()),
+            }
+        }
+        "unset" => ok_output("active model cleared".to_string()),
+        "" => err_output("usage: models <list|current|set|unset> [--json]".to_string()),
+        other => err_output(format!(
+            "unknown subcommand '{other}'; usage: models <list|current|set|unset> [--json]"
+        )),
+    }
+}
+
+/// A success result body (`exit_code 0` + `output`).
+fn ok_output(output: String) -> serde_json::Value {
+    serde_json::json!({ "exit_code": 0, "output": output })
+}
+
+/// A failure result body (`exit_code 1` + `error`).
+fn err_output(error: String) -> serde_json::Value {
+    serde_json::json!({ "exit_code": 1, "error": error })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `ProviderEntry` with a canonical id and a matching
+    /// `request_topic` so resolver tests read like the real discovered shape.
+    fn entry(id: &str) -> ProviderEntry {
+        let capsule = qualifier_of(id);
+        ProviderEntry {
+            id: id.to_string(),
+            description: format!("test entry {id}"),
+            request_topic: format!("{LLM_REQUEST_GENERATE_PREFIX}{capsule}"),
+            stream_topic: format!("llm.v1.stream.{capsule}"),
+            capabilities: vec!["text".to_string()],
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+        }
+    }
+
+    #[test]
+    fn resolve_exact_canonical_wins() {
+        let entries = vec![entry("openai-compat:gpt-5.4"), entry("openai:o3")];
+        let got = resolve_selection("openai-compat:gpt-5.4", &entries).expect("binds");
+        assert_eq!(got.id, "openai-compat:gpt-5.4");
+    }
+
+    #[test]
+    fn resolve_bare_unique_binds() {
+        let entries = vec![entry("openai-compat:gpt-5.4"), entry("openai:o3")];
+        let got = resolve_selection("gpt-5.4", &entries).expect("binds");
+        // The resolved entry's canonical id is the qualified form.
+        assert_eq!(got.id, "openai-compat:gpt-5.4");
+    }
+
+    #[test]
+    fn resolve_ollama_bare_colon_name() {
+        // Entry canonical id embeds a colon in the model half.
+        let entries = vec![entry("ollama:llama3.3:70b"), entry("openai:o3")];
+        let got = resolve_selection("llama3.3:70b", &entries).expect("binds via bare pass");
+        // Bound the ollama entry, NOT misread as capsule "llama3.3" / model "70b".
+        assert_eq!(got.id, "ollama:llama3.3:70b");
+    }
+
+    #[test]
+    fn resolve_qualified_only_on_miss() {
+        let entries = vec![entry("ollama:llama3.3:70b"), entry("openai:o3")];
+        // Fully qualified input: first-colon split yields capsule "ollama",
+        // model "llama3.3:70b" (embedded colon preserved).
+        let got = resolve_selection("ollama:llama3.3:70b", &entries).expect("binds via qualified");
+        assert_eq!(got.id, "ollama:llama3.3:70b");
+    }
+
+    #[test]
+    fn resolve_ambiguous_bare_errors() {
+        let entries = vec![entry("openai:gpt-5.4"), entry("openai-compat:gpt-5.4")];
+        let err = resolve_selection("gpt-5.4", &entries).expect_err("ambiguous");
+        match err {
+            ResolveError::Ambiguous { mut candidates } => {
+                candidates.sort();
+                assert_eq!(candidates, vec!["openai-compat:gpt-5.4", "openai:gpt-5.4"]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_stamp_authenticates_qualifier() {
+        // Reference stamp for "openai-compat" under the kernel namespace.
+        let source_id = "24838f4a-8175-5206-8b2d-81da2c6a8122";
+        let topic = "llm.v1.request.generate.openai-compat";
+
+        // Matching source authenticates the candidate.
+        assert_eq!(
+            authenticate_capsule(topic, source_id),
+            Some("openai-compat")
+        );
+
+        // A message CLAIMING the openai-compat suffix but stamped with any
+        // other source_id is rejected (anti-shadowing).
+        assert_eq!(
+            authenticate_capsule(topic, "deadbeef-0000-0000-0000-000000000000"),
+            None
+        );
+
+        // A topic without the fixed prefix yields no candidate at all.
+        assert_eq!(authenticate_capsule("some.other.topic", source_id), None);
+    }
+
+    #[test]
+    fn self_heal_remaps_bare_provider_id_after_upgrade() {
+        // Old single-entry selection, now upgraded to per-model entries.
+        let mut state = RegistryState {
+            providers: vec![
+                entry("openai-compat:gpt-4o"),
+                entry("openai-compat:gpt-5.4"),
+            ],
+            active_model_id: Some("openai-compat".to_string()),
+        };
+        let outcome = reconcile_active_model_in_place(&mut state);
+        // Remapped to the entry[0] default, NOT cleared and NOT the second entry.
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Remapped {
+                from: "openai-compat".to_string(),
+                to: entry("openai-compat:gpt-4o"),
+            }
+        );
+        assert_eq!(
+            state.active_model_id.as_deref(),
+            Some("openai-compat:gpt-4o")
+        );
+    }
+
+    #[test]
+    fn self_heal_clears_genuinely_gone() {
+        let mut state = RegistryState {
+            providers: vec![entry("openai-compat:gpt-4o")],
+            active_model_id: Some("deleted-cap:foo".to_string()),
+        };
+        let outcome = reconcile_active_model_in_place(&mut state);
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Cleared {
+                from: "deleted-cap:foo".to_string(),
+            }
+        );
+        assert_eq!(state.active_model_id, None);
+    }
+
+    #[test]
+    fn auto_select_picks_first_capsule_default_when_multi_model() {
+        // providers.len() == 3: the old `len == 1` gate would never fire here.
+        let mut state = RegistryState {
+            providers: vec![
+                entry("openai-compat:gpt-4o"),
+                entry("openai-compat:gpt-5.4"),
+                entry("openai:o3"),
+            ],
+            active_model_id: None,
+        };
+        let selected = auto_select_defaults_in_place(&mut state).expect("auto-selected");
+        assert_eq!(selected.id, "openai-compat:gpt-4o");
+        assert_eq!(
+            state.active_model_id.as_deref(),
+            Some("openai-compat:gpt-4o")
+        );
+    }
+
+    #[test]
+    fn auto_select_noop_when_already_selected() {
+        let mut state = RegistryState {
+            providers: vec![entry("openai-compat:gpt-4o"), entry("openai:o3")],
+            active_model_id: Some("openai:o3".to_string()),
+        };
+        let selected = auto_select_defaults_in_place(&mut state);
+        assert!(selected.is_none());
+        assert_eq!(state.active_model_id.as_deref(), Some("openai:o3"));
+    }
+
+    #[test]
+    fn cli_run_protocol_roundtrip() {
+        let entries = vec![entry("openai-compat:gpt-4o"), entry("openai:o3")];
+
+        // `list --json` -> exit 0, output parses as a JSON array of entries.
+        let list = models_result(
+            &["list".to_string(), "--json".to_string()],
+            &entries,
+            Some("openai-compat:gpt-4o"),
+        );
+        assert_eq!(list["exit_code"], 0);
+        let output = list["output"].as_str().expect("output string");
+        let arr: Vec<serde_json::Value> = serde_json::from_str(output).expect("json array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "openai-compat:gpt-4o");
+
+        // `set <unknown>` -> exit 1 with an error message.
+        let set = models_result(
+            &["set".to_string(), "no-such-model".to_string()],
+            &entries,
+            None,
+        );
+        assert_eq!(set["exit_code"], 1);
+        assert!(
+            set["error"]
+                .as_str()
+                .expect("error string")
+                .contains("unknown model")
+        );
+    }
+
+    #[test]
+    fn persisted_form_is_canonical_never_bare() {
+        let entries = vec![entry("openai-compat:gpt-5.4"), entry("openai:o3")];
+        // Resolving a bare unique input yields the canonical id for persistence.
+        let resolved = resolve_selection("gpt-5.4", &entries).expect("binds");
+        assert_eq!(resolved.id, "openai-compat:gpt-5.4");
+        assert_ne!(resolved.id, "gpt-5.4");
+    }
+}

@@ -34,6 +34,12 @@ use astrid_sdk::prelude::*;
 // Use the shared contract type — generated from WIT, serde-enabled.
 use astrid_sdk::contracts::registry::ProviderEntry;
 
+mod selection;
+use selection::{
+    ReconcileOutcome, RegistryState, authenticate_capsule, auto_select_defaults_in_place,
+    models_result, reconcile_active_model_in_place, resolve_selection,
+};
+
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The kernel's system session UUID, used to validate IPC messages from the kernel.
@@ -43,18 +49,17 @@ const KERNEL_UUID: &str = "00000000-0000-0000-0000-000000000000";
 const LLM_DESCRIBE_REQUEST_TOPIC: &str = "llm.v1.request.describe";
 const LLM_DESCRIBE_RESPONSE_TOPIC: &str = "llm.v1.response.describe";
 
+/// CLI run/result protocol topics (the scriptable `models` verb). The run
+/// topic is the providing capsule id; results are keyed by request id. See
+/// `astrid` `crates/astrid-cli/src/commands/capsule_verb.rs`.
+const CLI_RUN_TOPIC: &str = "cli.v1.command.run.registry";
+const CLI_RESULT_TOPIC_PREFIX: &str = "cli.v1.command.result.";
+
 /// Time the discovery routine waits for provider capsules to respond
 /// after the describe request is published. Provider capsules typically
 /// reply synchronously inside their interceptor, but we still give the
 /// bus a generous window to settle.
 const DISCOVERY_TIMEOUT_MS: u64 = 500;
-
-/// The persisted registry state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-struct RegistryState {
-    providers: Vec<ProviderEntry>,
-    active_model_id: Option<String>,
-}
 
 const STATE_KEY: &str = "registry_state";
 
@@ -132,19 +137,13 @@ fn discover_providers() -> Vec<ProviderEntry> {
         let step = remaining.min(100);
         match response_sub.recv(step) {
             Ok(result) => {
+                // One message = one authenticated source. Process each
+                // message's `providers` array AS A GROUP so the source's
+                // entry[0]-first emit order is preserved, and so the
+                // `<capsule>` qualifier is authenticated against THAT
+                // message's `source_id`.
                 for msg in &result.messages {
-                    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&msg.payload)
-                    else {
-                        continue;
-                    };
-                    let Some(arr) = payload.get("providers").and_then(|p| p.as_array()) else {
-                        continue;
-                    };
-                    for entry in arr {
-                        if let Ok(p) = serde_json::from_value::<ProviderEntry>(entry.clone()) {
-                            providers.push(p);
-                        }
-                    }
+                    providers.extend(stamp_message_providers(&msg.payload, &msg.source_id));
                 }
             }
             Err(_) => {
@@ -159,6 +158,53 @@ fn discover_providers() -> Vec<ProviderEntry> {
     }
 
     providers
+}
+
+/// Parse one describe message's `{"providers": [...]}` body, authenticate the
+/// emitting capsule against the kernel-stamped `source_id`, and return the
+/// entries with canonical `"<capsule>:<model>"` ids in the provider's emit
+/// order (entry[0] = that capsule's default hint).
+///
+/// Entries are dropped (with a warning) when:
+/// - the payload is malformed or has no `providers` array,
+/// - the `<capsule>` candidate derived from `request_topic` does not
+///   authenticate against `source_id` (anti-shadowing),
+/// - an entry's own `request_topic` suffix disagrees with the authenticated
+///   candidate (a provider may not smuggle entries it does not own).
+///
+/// The `<model>` half of the canonical id is the provider-reported entry
+/// `id`. Against today's single-entry providers that is the bare provider
+/// name, yielding e.g. `"openai-compat:openai-compat"` — graceful
+/// degradation, still resolvable by the bare name.
+fn stamp_message_providers(payload: &str, source_id: &str) -> Vec<ProviderEntry> {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return Vec::new();
+    };
+    let Some(arr) = payload.get("providers").and_then(|p| p.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for entry in arr {
+        let Ok(mut p) = serde_json::from_value::<ProviderEntry>(entry.clone()) else {
+            continue;
+        };
+        // Authenticate this entry's self-reported routing against the
+        // message's kernel-stamped source. Each entry carries its own
+        // `request_topic`; require its suffix to authenticate so a provider
+        // cannot mix in entries routed to a capsule it does not own.
+        let Some(capsule) = authenticate_capsule(&p.request_topic, source_id) else {
+            log::warn(format!(
+                "Dropping provider entry '{}' (request_topic '{}'): source '{}' does not authenticate the claimed capsule",
+                p.id, p.request_topic, source_id
+            ));
+            continue;
+        };
+        // `<model>` is the provider-reported id; stamp the canonical form.
+        p.id = format!("{capsule}:{}", p.id);
+        out.push(p);
+    }
+    out
 }
 
 /// Check whether a poll result contains at least one message from the kernel.
@@ -221,13 +267,15 @@ fn handle_get_active_model() {
         }
     }
 
-    // Prune a stale active id and auto-select when exactly one provider exists.
+    // Reconcile a stale active id (remap an old bare provider-id selection to
+    // that capsule's default after a single->multi upgrade, or clear a
+    // genuinely-gone one) and auto-select a default when nothing is selected.
     // Both take `&mut state` and mutate it in place (persisting only when they
-    // actually change something — `auto_select_if_single` is a no-op when a
-    // model is already selected or multiple providers exist), so the local copy
-    // is already current and no reload is needed.
-    clear_stale_active_model(&mut state);
-    auto_select_if_single(&mut state);
+    // actually change something — `auto_select_defaults` is a no-op when a
+    // model is already selected), so the local copy is already current and no
+    // reload is needed.
+    reconcile_active_model(&mut state);
+    auto_select_defaults(&mut state);
 
     let active = state
         .active_model_id
@@ -258,7 +306,13 @@ fn handle_set_active_model(payload: &serde_json::Value) {
     set_active_model_by_id(&model_id);
 }
 
-/// Set the active model by ID (extracted helper for reuse).
+/// Set the active model by operator input (extracted helper for reuse).
+///
+/// Resolves the input against the discovered/cached canonical entries via
+/// [`resolve_selection`] (accepting a bare model name when unambiguous), then
+/// persists `active_model_id` in CANONICAL `"<capsule>:<model>"` form — never
+/// the raw bare input, so a later install cannot retroactively make the
+/// stored selection ambiguous.
 fn set_active_model_by_id(model_id: &str) {
     let mut state = load_state();
 
@@ -266,43 +320,59 @@ fn set_active_model_by_id(model_id: &str) {
         state.providers = discover_providers();
     }
 
-    if let Some(provider) = state.providers.iter().find(|p| p.id == model_id).cloned() {
-        state.active_model_id = Some(model_id.to_string());
-        save_state(&state);
-        publish_model_changed(&provider);
-        let _ = ipc::publish_json(
-            "registry.v1.response.set_active_model",
-            &serde_json::json!({"status": "ok", "active_model": provider}),
-        );
-    } else {
-        let _ = ipc::publish_json(
-            "registry.v1.response.set_active_model",
-            &serde_json::json!({"error": format!("unknown model: {model_id}")}),
-        );
+    match resolve_selection(model_id, &state.providers) {
+        Ok(provider) => {
+            let provider = provider.clone();
+            state.active_model_id = Some(provider.id.clone());
+            save_state(&state);
+            publish_model_changed(&provider);
+            let _ = ipc::publish_json(
+                "registry.v1.response.set_active_model",
+                &serde_json::json!({"status": "ok", "active_model": provider}),
+            );
+        }
+        Err(e) => {
+            let _ = ipc::publish_json(
+                "registry.v1.response.set_active_model",
+                &serde_json::json!({"error": e.message()}),
+            );
+        }
     }
 }
 
-/// Clear `active_model_id` if it no longer resolves to a known provider.
-fn clear_stale_active_model(state: &mut RegistryState) {
-    if let Some(ref id) = state.active_model_id
-        && !state.providers.iter().any(|p| &p.id == id)
-    {
-        log::info(format!(
-            "Active model '{id}' no longer available after reload, clearing"
-        ));
-        state.active_model_id = None;
-        save_state(state);
+/// Reconcile a stored `active_model_id` against the current entries, persisting
+/// and emitting the change event when one occurs.
+///
+/// Persists only when the value actually changes (mirrors the CAS discipline —
+/// no write when nothing moved). Runs lazily, so a stored selection heals on
+/// the next `get_active_model` or reload — no upgrade hook required.
+fn reconcile_active_model(state: &mut RegistryState) {
+    match reconcile_active_model_in_place(state) {
+        ReconcileOutcome::Unchanged => {}
+        ReconcileOutcome::Remapped { from, to } => {
+            log::info(format!(
+                "Migrated active model binding '{from}' -> '{}'",
+                to.id
+            ));
+            save_state(state);
+            publish_model_changed(&to);
+        }
+        ReconcileOutcome::Cleared { from } => {
+            log::info(format!(
+                "Active model '{from}' no longer available after reload, clearing"
+            ));
+            save_state(state);
+        }
     }
 }
 
-/// Auto-select the sole provider if exactly one is available.
-fn auto_select_if_single(state: &mut RegistryState) {
-    if state.providers.len() == 1 && state.active_model_id.is_none() {
-        let provider = state.providers[0].clone();
-        state.active_model_id = Some(provider.id.clone());
+/// Auto-select a default model when none is selected (multi-model aware),
+/// persisting and emitting the change event when one occurs.
+fn auto_select_defaults(state: &mut RegistryState) {
+    if let Some(provider) = auto_select_defaults_in_place(state) {
         save_state(state);
         publish_model_changed(&provider);
-        log::info(format!("Auto-selected sole LLM provider: {}", provider.id));
+        log::info(format!("Auto-selected default LLM model: {}", provider.id));
     }
 }
 
@@ -356,6 +426,73 @@ fn dispatch_command_messages(result: &ipc::PollResult) {
                 emit_model_selection();
             }
         }
+    }
+}
+
+/// Dispatch scriptable `models` verb runs over the CLI run/result protocol.
+///
+/// Run body: `{ req_id, command: "models", args: [...] }` (see `astrid`
+/// `crates/astrid-cli/src/commands/capsule_verb.rs`). The reply is published
+/// on `cli.v1.command.result.<req_id>` as `{ exit_code, output, error? }`.
+///
+/// `set` and `unset` mutate persisted state here (the side effect IPC/KV can't
+/// be folded into the pure builder); everything else just shapes and replies.
+fn dispatch_cli_run_messages(result: &ipc::PollResult) {
+    for msg in &result.messages {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&msg.payload) else {
+            continue;
+        };
+        let Some(req_id) = payload.get("req_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let args: Vec<String> = payload
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| a.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Discover/cache providers so `list`/`current`/`set` see entries even
+        // on a fresh principal (mirrors the other handlers).
+        let mut state = load_state();
+        if state.providers.is_empty() {
+            let providers = discover_providers();
+            if !providers.is_empty() {
+                state.providers = providers;
+                save_state(&state);
+            }
+        }
+        // Heal a stale binding before reporting/using `active`.
+        reconcile_active_model(&mut state);
+
+        let body = models_result(&args, &state.providers, state.active_model_id.as_deref());
+
+        // Apply the side effects for the mutating subcommands, but only when
+        // the pure builder reported success (resolution passed).
+        let succeeded = body
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|c| c == 0);
+        match args.first().map(String::as_str) {
+            Some("set") if succeeded => {
+                if let Some(input) = args.get(1) {
+                    set_active_model_by_id(input);
+                }
+            }
+            Some("unset") => {
+                if state.active_model_id.is_some() {
+                    state.active_model_id = None;
+                    save_state(&state);
+                }
+            }
+            _ => {}
+        }
+
+        let topic = format!("{CLI_RESULT_TOPIC_PREFIX}{req_id}");
+        let _ = ipc::publish_json(&topic, &body);
     }
 }
 
@@ -437,6 +574,7 @@ impl Registry {
 
         let sub = ipc::subscribe("registry.v1.*")?;
         let cmd_sub = ipc::subscribe("cli.v1.command.execute")?;
+        let run_sub = ipc::subscribe(CLI_RUN_TOPIC)?;
         let selection_sub = ipc::subscribe("registry.v1.selection.callback")?;
         let capsules_loaded_sub = ipc::subscribe("astrid.v1.capsules_loaded")?;
 
@@ -465,11 +603,11 @@ impl Registry {
         } else if state.providers.is_empty() {
             log::warn("Initial provider discovery returned empty and no cached providers exist");
         }
-        clear_stale_active_model(&mut state);
-        auto_select_if_single(&mut state);
+        reconcile_active_model(&mut state);
+        auto_select_defaults(&mut state);
 
         // Event loop — blocks on the primary subscription, then drains auxiliary.
-        // All four subscriptions are RAII (`Subscription`); their `Drop`
+        // All five subscriptions are RAII (`Subscription`); their `Drop`
         // releases the kernel-side resource at scope exit, so no manual
         // `unsubscribe` is required.
         loop {
@@ -481,6 +619,11 @@ impl Registry {
             // Drain CLI command messages (non-blocking).
             if let Ok(result) = cmd_sub.poll() {
                 dispatch_command_messages(&result);
+            }
+
+            // Drain scriptable `models` verb runs (non-blocking).
+            if let Ok(result) = run_sub.poll() {
+                dispatch_cli_run_messages(&result);
             }
 
             // Drain model selection callbacks from the TUI picker.
@@ -498,8 +641,8 @@ impl Registry {
                 if !providers.is_empty() {
                     state.providers = providers;
                     save_state(&state);
-                    clear_stale_active_model(&mut state);
-                    auto_select_if_single(&mut state);
+                    reconcile_active_model(&mut state);
+                    auto_select_defaults(&mut state);
                 }
             }
         }
