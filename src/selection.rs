@@ -24,6 +24,22 @@ const CAPSULE_ID_NAMESPACE: uuid::Uuid =
 /// this prefix is the candidate `<capsule>` qualifier we authenticate.
 const LLM_REQUEST_GENERATE_PREFIX: &str = "llm.v1.request.generate.";
 
+/// The `models` subcommands the registry understands. Named so the dispatcher
+/// can recognise a valid subcommand (and short-circuit an unknown one before
+/// paying for provider discovery) without re-typing the literals.
+pub(crate) const SUB_LIST: &str = "list";
+pub(crate) const SUB_CURRENT: &str = "current";
+pub(crate) const SUB_SET: &str = "set";
+pub(crate) const SUB_UNSET: &str = "unset";
+
+/// Whether `sub` is a `models` subcommand the registry handles. Used by the
+/// dispatcher to reject an unknown/empty subcommand early — before provider
+/// discovery — so a typo or `--help` query doesn't wait out the discovery
+/// window.
+pub(crate) fn is_known_subcommand(sub: &str) -> bool {
+    matches!(sub, SUB_LIST | SUB_CURRENT | SUB_SET | SUB_UNSET)
+}
+
 /// The persisted registry state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct RegistryState {
@@ -158,8 +174,14 @@ pub(crate) fn authenticate_capsule<'a>(request_topic: &'a str, source_id: &str) 
     if candidate.is_empty() {
         return None;
     }
+    // Parse the kernel-stamped `source_id` into a `Uuid` and compare by value:
+    // this avoids the `expected.to_string()` allocation and, crucially, is
+    // hyphenation/case-insensitive, so a well-formed but differently-cased
+    // `source_id` still authenticates. A `source_id` that does not parse as a
+    // UUID cannot have been stamped by the kernel — drop the candidate.
+    let actual = uuid::Uuid::parse_str(source_id).ok()?;
     let expected = uuid::Uuid::new_v5(&CAPSULE_ID_NAMESPACE, candidate.as_bytes());
-    (expected.to_string() == source_id).then_some(candidate)
+    (expected == actual).then_some(candidate)
 }
 
 /// What a reconcile decided to do with a stored `active_model_id`. Returned by
@@ -290,7 +312,7 @@ pub(crate) fn models_result(
     let wants_json = args.iter().any(|a| a == "--json");
 
     match sub {
-        "list" => {
+        SUB_LIST => {
             if wants_json {
                 let arr: Vec<serde_json::Value> = entries.iter().map(entry_to_json).collect();
                 ok_output(serde_json::Value::Array(arr).to_string())
@@ -298,7 +320,7 @@ pub(crate) fn models_result(
                 ok_output(render_list_table(entries, active))
             }
         }
-        "current" => {
+        SUB_CURRENT => {
             if wants_json {
                 let entry = active.and_then(|id| entries.iter().find(|e| e.id == id));
                 let body = serde_json::json!({ "active": entry.map(entry_to_json) });
@@ -307,7 +329,7 @@ pub(crate) fn models_result(
                 ok_output(active.unwrap_or("none").to_string())
             }
         }
-        "set" => {
+        SUB_SET => {
             let Some(input) = args.get(1) else {
                 return err_output("usage: models set <id>".to_string());
             };
@@ -316,7 +338,7 @@ pub(crate) fn models_result(
                 Err(e) => err_output(e.message()),
             }
         }
-        "unset" => ok_output("active model cleared".to_string()),
+        SUB_UNSET => ok_output("active model cleared".to_string()),
         "" => err_output("usage: models <list|current|set|unset> [--json]".to_string()),
         other => err_output(format!(
             "unknown subcommand '{other}'; usage: models <list|current|set|unset> [--json]"
@@ -426,12 +448,24 @@ mod tests {
             Some("openai-compat")
         );
 
+        // The same UUID in upper-case still authenticates: we compare parsed
+        // `Uuid` values, not raw strings, so case/hyphenation differences in a
+        // well-formed source_id do not spuriously reject it.
+        assert_eq!(
+            authenticate_capsule(topic, &source_id.to_uppercase()),
+            Some("openai-compat")
+        );
+
         // A message CLAIMING the openai-compat suffix but stamped with any
         // other source_id is rejected (anti-shadowing).
         assert_eq!(
             authenticate_capsule(topic, "deadbeef-0000-0000-0000-000000000000"),
             None
         );
+
+        // A source_id that is not a parseable UUID cannot have been stamped by
+        // the kernel — reject rather than risk a string-shaped bypass.
+        assert_eq!(authenticate_capsule(topic, "not-a-uuid"), None);
 
         // A topic without the fixed prefix yields no candidate at all.
         assert_eq!(authenticate_capsule("some.other.topic", source_id), None);

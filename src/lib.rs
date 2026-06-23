@@ -38,7 +38,7 @@ use astrid_sdk::contracts::registry::ProviderEntry;
 mod selection;
 use selection::{
     ReconcileOutcome, RegistryState, authenticate_capsule, auto_select_defaults_in_place,
-    models_result, reconcile_active_model_in_place, resolve_selection,
+    is_known_subcommand, models_result, reconcile_active_model_in_place, resolve_selection,
 };
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -55,6 +55,31 @@ const LLM_DESCRIBE_RESPONSE_TOPIC: &str = "llm.v1.response.describe";
 /// `astrid` `crates/astrid-cli/src/commands/capsule_verb.rs`.
 const CLI_RUN_TOPIC: &str = "cli.v1.command.run.registry";
 const CLI_RESULT_TOPIC_PREFIX: &str = "cli.v1.command.result.";
+
+/// Maximum accepted length of an incoming `req_id`. The CLI sends a 32-char
+/// hex simple UUID; allow a little slack (e.g. the hyphenated 36-char form)
+/// but bound it so a hostile value can't bloat the derived topic.
+const MAX_REQ_ID_LEN: usize = 64;
+
+/// Validate an incoming `req_id` before it is interpolated into the result
+/// topic `cli.v1.command.result.<req_id>`.
+///
+/// `req_id` is UNTRUSTED — it arrives in the run payload. The CLI subscribes
+/// to `cli.v1.command.result.*`, a single trailing wildcard *segment*. A
+/// `req_id` containing a topic separator (`.`) or a wildcard (`*`) would
+/// publish to a topic that does not match that subscription (it would split
+/// into extra segments), so the reply would silently never reach the caller —
+/// or could be steered onto an unrelated topic. We therefore accept only the
+/// shape the CLI actually emits (`Uuid::new_v4().simple()` = lowercase hex),
+/// tolerating the hyphenated UUID form, and reject everything else: a
+/// non-empty run of ASCII alphanumerics and `-`, within a length bound.
+pub(crate) fn is_valid_req_id(req_id: &str) -> bool {
+    !req_id.is_empty()
+        && req_id.len() <= MAX_REQ_ID_LEN
+        && req_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
 
 /// Time the discovery routine waits for provider capsules to respond
 /// after the describe request is published. Provider capsules typically
@@ -463,6 +488,17 @@ fn dispatch_cli_run_messages(result: &ipc::PollResult) {
         let Some(req_id) = payload.get("req_id").and_then(|v| v.as_str()) else {
             continue;
         };
+        // `req_id` is untrusted and is interpolated into the result topic.
+        // Reject any value that isn't the safe single-segment shape the CLI
+        // sends BEFORE doing any work or deriving a topic — never publish to a
+        // topic built from a malformed/hostile req_id.
+        if !is_valid_req_id(req_id) {
+            log::warn(format!(
+                "registry: dropping cli run with invalid req_id (len {})",
+                req_id.len()
+            ));
+            continue;
+        }
         let args: Vec<String> = payload
             .get("args")
             .and_then(|v| v.as_array())
@@ -472,6 +508,16 @@ fn dispatch_cli_run_messages(result: &ipc::PollResult) {
                     .collect()
             })
             .unwrap_or_default();
+
+        // Reject an unknown/empty subcommand (typo or `--help` query) BEFORE
+        // provider discovery, so it doesn't wait out the ~500ms discovery
+        // window. The error body is independent of discovered entries.
+        if !is_known_subcommand(args.first().map(String::as_str).unwrap_or("")) {
+            let body = models_result(&args, &[], None);
+            let topic = format!("{CLI_RESULT_TOPIC_PREFIX}{req_id}");
+            let _ = ipc::publish_json(&topic, &body);
+            continue;
+        }
 
         // Discover/cache providers so `list`/`current`/`set` see entries even
         // on a fresh principal (mirrors the other handlers).
@@ -699,5 +745,29 @@ mod tests {
         let changed = serde_json::to_value(&entry).expect("serialize entry");
         assert!(changed.is_object(), "a real change serializes to an object");
         assert_ne!(payload, changed);
+    }
+
+    /// `req_id` is interpolated into the result topic; only the single-segment
+    /// shape the CLI actually sends may pass. Anything carrying a topic
+    /// separator (`.`), a wildcard (`*`), whitespace, or that is empty/oversized
+    /// must be rejected so we never publish to a derived, unexpected topic.
+    #[test]
+    fn req_id_validation_accepts_cli_shape_rejects_topic_injection() {
+        // The exact shape the CLI emits: `Uuid::new_v4().simple()` (32 hex).
+        assert!(is_valid_req_id("0123456789abcdef0123456789abcdef"));
+        // Hyphenated UUID form is tolerated.
+        assert!(is_valid_req_id("01234567-89ab-cdef-0123-456789abcdef"));
+
+        // Topic separator would split into extra segments and miss the CLI's
+        // `cli.v1.command.result.*` single-wildcard subscription.
+        assert!(!is_valid_req_id("abc.def"));
+        // Wildcard chars must never reach a published topic.
+        assert!(!is_valid_req_id("abc*"));
+        assert!(!is_valid_req_id("*"));
+        // Whitespace and empty are not the CLI shape.
+        assert!(!is_valid_req_id("abc def"));
+        assert!(!is_valid_req_id(""));
+        // Oversized values are bounded out.
+        assert!(!is_valid_req_id(&"a".repeat(MAX_REQ_ID_LEN + 1)));
     }
 }
