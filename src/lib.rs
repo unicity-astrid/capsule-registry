@@ -15,7 +15,10 @@
 //! **Queries** (publish to these topics, registry responds on `registry.v1.response.*`):
 //! - `registry.v1.get_providers` — returns list of available LLM providers
 //! - `registry.v1.get_active_model` — returns the currently active model
-//! - `registry.v1.set_active_model` — payload: `{"model_id": "..."}`, sets active model
+//! - `registry.v1.set_active_model` — payload: `{"model_id": "...", "corr_id"?: "..."}`,
+//!   sets active model. The optional `corr_id` is echoed verbatim into the
+//!   `registry.v1.response.set_active_model` reply (ok and error) so a gateway
+//!   can disambiguate concurrent same-principal SET replies; omitted when absent.
 //!
 //! **Events** (published by registry):
 //! - `registry.v1.active_model_changed` — payload: `ProviderEntry` on a model
@@ -327,25 +330,67 @@ fn handle_get_active_model() {
     let _ = ipc::publish_json("registry.v1.response.get_active_model", &active);
 }
 
-/// Handle a `registry.v1.set_active_model` request.
-fn handle_set_active_model(payload: &serde_json::Value) {
-    let model_id = match payload
+/// Extract an optional field from a request payload, mirroring the `model_id`
+/// lookup: nested under `data` first, then at the top level. Returns an owned
+/// `String` so the value survives the borrow of `payload`.
+fn extract_request_field(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
         .get("data")
-        .and_then(|d| d.get("model_id"))
+        .and_then(|d| d.get(key))
         .and_then(|v| v.as_str())
-        .or_else(|| payload.get("model_id").and_then(|v| v.as_str()))
-    {
-        Some(id) => id.to_string(),
+        .or_else(|| payload.get(key).and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// Build the success response object for a `set_active_model` request,
+/// echoing the request's `corr_id` verbatim when present and omitting the
+/// field entirely when absent (back-compat: callers that send no `corr_id`
+/// must see an unchanged response body).
+fn set_active_model_ok_response(
+    provider: &ProviderEntry,
+    corr_id: Option<&str>,
+) -> serde_json::Value {
+    let mut obj = serde_json::json!({"status": "ok", "active_model": provider});
+    if let Some(corr_id) = corr_id {
+        obj["corr_id"] = serde_json::Value::String(corr_id.to_string());
+    }
+    obj
+}
+
+/// Build the error response object for a `set_active_model` request, echoing
+/// the request's `corr_id` verbatim when present and omitting it otherwise.
+/// Mirrors [`set_active_model_ok_response`] so a correlated caller can match
+/// either outcome by `corr_id`.
+fn set_active_model_error_response(error: &str, corr_id: Option<&str>) -> serde_json::Value {
+    let mut obj = serde_json::json!({"error": error});
+    if let Some(corr_id) = corr_id {
+        obj["corr_id"] = serde_json::Value::String(corr_id.to_string());
+    }
+    obj
+}
+
+/// Handle a `registry.v1.set_active_model` request.
+///
+/// Reads the OPTIONAL `corr_id` alongside `model_id` (same extraction shape)
+/// and echoes it verbatim into every reply on
+/// `registry.v1.response.set_active_model`. This lets the gateway, when two
+/// concurrent same-principal SET requests race on the routed reply stream,
+/// keep its own reply and skip the other — closing the wrong-response-body
+/// race (state itself was already correct via the CAS in `save_state`).
+fn handle_set_active_model(payload: &serde_json::Value) {
+    let corr_id = extract_request_field(payload, "corr_id");
+    let model_id = match extract_request_field(payload, "model_id") {
+        Some(id) => id,
         None => {
             let _ = ipc::publish_json(
                 "registry.v1.response.set_active_model",
-                &serde_json::json!({"error": "missing model_id"}),
+                &set_active_model_error_response("missing model_id", corr_id.as_deref()),
             );
             return;
         }
     };
 
-    set_active_model_by_id(&model_id);
+    set_active_model_by_id(&model_id, corr_id.as_deref());
 }
 
 /// Set the active model by operator input (extracted helper for reuse).
@@ -355,7 +400,12 @@ fn handle_set_active_model(payload: &serde_json::Value) {
 /// persists `active_model_id` in CANONICAL `"<capsule>:<model>"` form — never
 /// the raw bare input, so a later install cannot retroactively make the
 /// stored selection ambiguous.
-fn set_active_model_by_id(model_id: &str) {
+///
+/// `corr_id` is the optional correlation id of the originating
+/// `set_active_model` request; it is echoed verbatim into the reply when
+/// `Some`. Non-request callers (CLI `/models`, CLI `run`, TUI selection
+/// callback) pass `None`, preserving the existing uncorrelated reply body.
+fn set_active_model_by_id(model_id: &str, corr_id: Option<&str>) {
     let mut state = load_state();
 
     if state.providers.is_empty() {
@@ -370,13 +420,13 @@ fn set_active_model_by_id(model_id: &str) {
             publish_model_changed(&provider);
             let _ = ipc::publish_json(
                 "registry.v1.response.set_active_model",
-                &serde_json::json!({"status": "ok", "active_model": provider}),
+                &set_active_model_ok_response(&provider, corr_id),
             );
         }
         Err(e) => {
             let _ = ipc::publish_json(
                 "registry.v1.response.set_active_model",
-                &serde_json::json!({"error": e.message()}),
+                &set_active_model_error_response(&e.message(), corr_id),
             );
         }
     }
@@ -464,7 +514,7 @@ fn dispatch_command_messages(result: &ipc::PollResult) {
 
         if cmd == "/models" {
             if parts.len() >= 2 {
-                set_active_model_by_id(parts[1]);
+                set_active_model_by_id(parts[1], None);
             } else {
                 emit_model_selection();
             }
@@ -543,7 +593,7 @@ fn dispatch_cli_run_messages(result: &ipc::PollResult) {
         match args.first().map(String::as_str) {
             Some("set") if succeeded => {
                 if let Some(input) = args.get(1) {
-                    set_active_model_by_id(input);
+                    set_active_model_by_id(input, None);
                 }
             }
             Some("unset") => {
@@ -576,7 +626,7 @@ fn dispatch_selection_messages(result: &ipc::PollResult) {
             .or_else(|| payload.get("selected_id").and_then(|v| v.as_str()));
 
         if let Some(model_id) = selected_id {
-            set_active_model_by_id(model_id);
+            set_active_model_by_id(model_id, None);
         }
     }
 }
@@ -769,5 +819,89 @@ mod tests {
         assert!(!is_valid_req_id(""));
         // Oversized values are bounded out.
         assert!(!is_valid_req_id(&"a".repeat(MAX_REQ_ID_LEN + 1)));
+    }
+
+    fn test_entry() -> ProviderEntry {
+        ProviderEntry {
+            id: "openai-compat:gpt-5.4".to_string(),
+            description: "test".to_string(),
+            request_topic: "llm.v1.request.generate.openai-compat".to_string(),
+            stream_topic: "llm.v1.stream.openai-compat".to_string(),
+            capabilities: vec!["text".to_string()],
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+        }
+    }
+
+    /// A `set_active_model` request carrying a `corr_id` must echo that exact
+    /// value into both the success and the error reply objects, so the gateway
+    /// can match its own reply on the routed stream and skip a racing
+    /// concurrent same-principal reply. The value is reflected verbatim — no
+    /// normalization, no regeneration.
+    #[test]
+    fn set_active_model_response_echoes_corr_id_when_present() {
+        let entry = test_entry();
+        let corr = "11111111-2222-3333-4444-555555555555";
+
+        let ok = set_active_model_ok_response(&entry, Some(corr));
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["corr_id"], corr, "ok reply must echo corr_id verbatim");
+        assert_eq!(
+            ok["active_model"],
+            serde_json::to_value(&entry).unwrap(),
+            "ok reply must still carry the resolved active_model"
+        );
+
+        let err = set_active_model_error_response("unknown model", Some(corr));
+        assert_eq!(err["error"], "unknown model");
+        assert_eq!(
+            err["corr_id"], corr,
+            "error reply must echo corr_id verbatim too"
+        );
+    }
+
+    /// Back-compat: a request without a `corr_id` (existing TUI/react/CLI
+    /// callers) must produce a reply with NO `corr_id` key at all — not a
+    /// `null`, not an empty string — so the on-wire shape those callers parse
+    /// is unchanged.
+    #[test]
+    fn set_active_model_response_omits_corr_id_when_absent() {
+        let entry = test_entry();
+
+        let ok = set_active_model_ok_response(&entry, None);
+        assert!(
+            ok.get("corr_id").is_none(),
+            "ok reply must omit corr_id when the request carried none"
+        );
+        assert_eq!(ok["status"], "ok");
+
+        let err = set_active_model_error_response("unknown model", None);
+        assert!(
+            err.get("corr_id").is_none(),
+            "error reply must omit corr_id when the request carried none"
+        );
+        assert_eq!(err["error"], "unknown model");
+    }
+
+    /// `corr_id` is read with the same nested-then-top-level shape as
+    /// `model_id`, and is absent (`None`) when the request omits it — driving
+    /// the omit-on-absent reply path above.
+    #[test]
+    fn extract_request_field_mirrors_model_id_shape() {
+        // Nested under `data`.
+        let nested = serde_json::json!({"data": {"corr_id": "abc"}});
+        assert_eq!(
+            extract_request_field(&nested, "corr_id").as_deref(),
+            Some("abc")
+        );
+        // Top level.
+        let top = serde_json::json!({"corr_id": "def"});
+        assert_eq!(
+            extract_request_field(&top, "corr_id").as_deref(),
+            Some("def")
+        );
+        // Absent → None (back-compat callers).
+        let bare = serde_json::json!({"model_id": "openai-compat:gpt-5.4"});
+        assert_eq!(extract_request_field(&bare, "corr_id"), None);
     }
 }
