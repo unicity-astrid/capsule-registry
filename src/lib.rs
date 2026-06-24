@@ -887,9 +887,11 @@ mod tests {
         // The CLI publishes to cli.v1.command.run.<provider_capsule>, where
         // provider_capsule comes from GetCommands and is the package id.
         assert_eq!(CLI_RUN_TOPIC, "cli.v1.command.run.astrid-capsule-registry");
+
+        // Ensure Capsule.toml subscription matches CLI_RUN_TOPIC to prevent drift.
         let capsule_toml = include_str!("../Capsule.toml");
         assert!(
-            capsule_toml.contains(&format!("\"{CLI_RUN_TOPIC}\"")),
+            capsule_toml.contains(&format!("\"{}\"", CLI_RUN_TOPIC)),
             "Capsule.toml is missing subscription for {CLI_RUN_TOPIC}"
         );
     }
