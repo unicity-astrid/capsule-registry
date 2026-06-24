@@ -57,7 +57,7 @@ const LLM_DESCRIBE_RESPONSE_TOPIC: &str = "llm.v1.response.describe";
 /// CLI run/result protocol topics (the scriptable `models` verb). The run
 /// topic is the providing capsule id; results are keyed by request id. See
 /// `astrid` `crates/astrid-cli/src/commands/capsule_verb.rs`.
-const CLI_RUN_TOPIC: &str = "cli.v1.command.run.registry";
+const CLI_RUN_TOPIC: &str = "cli.v1.command.run.astrid-capsule-registry";
 const CLI_RESULT_TOPIC_PREFIX: &str = "cli.v1.command.result.";
 
 /// Maximum accepted length of an incoming `req_id`. The CLI sends a 32-char
@@ -90,9 +90,9 @@ pub(crate) fn is_valid_req_id(req_id: &str) -> bool {
 }
 
 /// The only `command` this capsule's CLI run topic implements. The run topic
-/// `cli.v1.command.run.registry` is per-capsule, not per-verb, so the payload's
-/// `command` field must be validated against this before its args are treated
-/// as a `models` subcommand.
+/// suffix is the package id returned as `provider_capsule` by GetCommands. It
+/// is per-capsule, not per-verb, so the payload's `command` field must be
+/// validated against this before its args are treated as a `models` subcommand.
 const CLI_RUN_COMMAND: &str = "models";
 
 /// Whether a CLI run payload's `command` field names the verb this capsule
@@ -584,7 +584,7 @@ fn dispatch_cli_run_messages(result: &ipc::PollResult) {
             ));
             continue;
         }
-        // The run topic `cli.v1.command.run.registry` is per-CAPSULE, not
+        // The run topic `cli.v1.command.run.<provider_capsule>` is per-CAPSULE, not
         // per-verb: every `astrid capsule <verb>` the registry declares lands
         // here. We only implement `models`, so reject any other `command` rather
         // than treating its args as a models subcommand.
@@ -882,7 +882,15 @@ mod tests {
         assert!(!is_valid_req_id("0123456789abcdefg"));
     }
 
-    /// The CLI run topic `cli.v1.command.run.registry` is per-capsule, not
+    #[test]
+    fn cli_run_topic_uses_provider_capsule_package_id() {
+        // The CLI publishes to cli.v1.command.run.<provider_capsule>, where
+        // provider_capsule comes from GetCommands and is the package id.
+        assert_eq!(CLI_RUN_TOPIC, "cli.v1.command.run.astrid-capsule-registry");
+        assert!(!CLI_RUN_TOPIC.ends_with(".registry"));
+    }
+
+    /// The CLI run topic is per-capsule, not
     /// per-verb. Only a payload whose `command` is `"models"` may be dispatched
     /// as a models subcommand; any other command (or a missing/non-string
     /// field) must be rejected so unrelated verbs aren't misinterpreted as
