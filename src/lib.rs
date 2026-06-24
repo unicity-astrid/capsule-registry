@@ -892,7 +892,8 @@ mod tests {
         let capsule_toml = include_str!("../Capsule.toml");
         assert!(
             capsule_toml.contains(&format!("\"{}\"", CLI_RUN_TOPIC)),
-            "Capsule.toml is missing subscription for {CLI_RUN_TOPIC}"
+            "Capsule.toml is missing subscription for {}",
+            CLI_RUN_TOPIC
         );
     }
 
