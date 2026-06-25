@@ -40,8 +40,8 @@ use astrid_sdk::contracts::registry::ProviderEntry;
 
 mod selection;
 use selection::{
-    ReconcileOutcome, RegistryState, authenticate_capsule, auto_select_defaults_in_place,
-    is_known_subcommand, models_result, reconcile_active_model_in_place, resolve_selection,
+    ReconcileOutcome, RegistryState, auto_select_defaults_in_place, is_known_subcommand,
+    models_result, reconcile_active_model_in_place, request_topic_qualifier, resolve_selection,
     subcommand_needs_discovery,
 };
 
@@ -201,11 +201,11 @@ fn discover_providers() -> Vec<ProviderEntry> {
         let step = remaining.min(100);
         match response_sub.recv(step) {
             Ok(result) => {
-                // One message = one authenticated source. Process each
+                // One message = one kernel-stamped source. Process each
                 // message's `providers` array AS A GROUP so the source's
-                // entry[0]-first emit order is preserved, and so the
-                // `<capsule>` qualifier is authenticated against THAT
-                // message's `source_id`.
+                // entry[0]-first emit order is preserved. The route qualifier
+                // is validated as a concrete LLM generate topic, but it is not
+                // forced to equal the capsule package name.
                 for msg in &result.messages {
                     providers.extend(stamp_message_providers(&msg.payload, &msg.source_id));
                 }
@@ -223,18 +223,16 @@ fn discover_providers() -> Vec<ProviderEntry> {
 }
 
 /// Parse one describe message's `{"providers": [...]}` body and return its
-/// entries with canonical `"<capsule>:<model>"` ids in the provider's emit
-/// order (entry[0] = that capsule's default hint). Each entry is authenticated
-/// INDIVIDUALLY: its own `request_topic` suffix is the `<capsule>` candidate,
-/// which must stamp (UUIDv5) to the message's kernel-stamped `source_id`. There
-/// is no separate per-message candidate — a provider may not smuggle in entries
-/// routed to a capsule it does not own.
+/// entries with canonical `"<provider>:<model>"` ids in the provider's emit
+/// order (entry[0] = that provider's default hint). Each entry must name a
+/// concrete `llm.v1.request.generate.<provider>` route; the trailing provider
+/// qualifier is a routing alias, not a package identity assertion.
 ///
 /// A malformed payload, or one with no `providers` array, returns empty
 /// SILENTLY (no warning) — it is treated as "this message carried no
-/// providers". Only a PER-ENTRY authentication failure is dropped WITH a
-/// warning (anti-shadowing). An entry whose JSON does not deserialize into a
-/// `ProviderEntry` is skipped silently.
+/// providers". Only a per-entry invalid route is dropped WITH a warning. An
+/// entry whose JSON does not deserialize into a `ProviderEntry` is skipped
+/// silently.
 ///
 /// The `<model>` half of the canonical id is the provider-reported entry
 /// `id`. Against today's single-entry providers that is the bare provider
@@ -253,13 +251,12 @@ fn stamp_message_providers(payload: &str, source_id: &str) -> Vec<ProviderEntry>
         let Ok(mut p) = serde_json::from_value::<ProviderEntry>(entry.clone()) else {
             continue;
         };
-        // Authenticate this entry's self-reported routing against the
-        // message's kernel-stamped source. Each entry carries its own
-        // `request_topic`; require its suffix to authenticate so a provider
-        // cannot mix in entries routed to a capsule it does not own.
-        let Some(capsule) = authenticate_capsule(&p.request_topic, source_id) else {
+        // Each entry carries its own route topic. The suffix is the provider
+        // qualifier used for model selection, but it is deliberately not
+        // required to equal the package name encoded by `source_id`.
+        let Some(capsule) = request_topic_qualifier(&p.request_topic) else {
             log::warn(format!(
-                "Dropping provider entry '{}' (request_topic '{}'): source '{}' does not authenticate the claimed capsule",
+                "Dropping provider entry '{}' (request_topic '{}'): source '{}' did not provide a concrete LLM generate route",
                 p.id, p.request_topic, source_id
             ));
             continue;

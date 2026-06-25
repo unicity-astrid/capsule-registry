@@ -12,7 +12,7 @@ In the OS model, this capsule is the device manager. It discovers which LLM prov
 1. Waits for `astrid.v1.capsules_loaded` from the kernel (all capsules booted)
 2. Queries the kernel for capsule metadata via `GetCapsuleMetadata`
 3. Resolves provider entries: model ID, description, capsule name, request/stream topics, capabilities
-4. Stamps each entry's canonical selection id as `"<capsule>:<model>"`, where `<capsule>` is the publisher authenticated against the kernel-stamped IPC `source_id` (a provider cannot claim a qualifier it does not cryptographically own)
+4. Stamps each entry's canonical selection id as `"<provider>:<model>"`, where `<provider>` comes from the concrete `llm.v1.request.generate.<provider>` route advertised by the provider
 5. Persists the provider list and active model in the capsule KV store
 6. Auto-selects a default for a fresh principal — the first discovered capsule's default-hint model (entry[0] of its contribution)
 
@@ -46,7 +46,7 @@ Selection ids are matched structurally so ollama-style model names with colons (
 
 ## Security
 
-Reload/boot signals are only honoured from the kernel's system session UUID. Provider discovery entries are bound to a `<capsule>` qualifier only after the provider's self-reported routing is authenticated against the kernel-stamped IPC `source_id` (recomputed as `uuid_v5(namespace, candidate)`); a provider cannot publish entries shadowing another capsule's models. Entries that fail authentication, and messages from untrusted sources, are logged and discarded.
+Reload/boot signals are only honoured from the kernel's system session UUID. Provider discovery accepts only entries that advertise a concrete `llm.v1.request.generate.<provider>` route; wildcard, empty, and multi-segment route aliases are discarded. The registry does not force the route alias to match the capsule package name: topic names are routing contracts, while sender provenance belongs in the kernel-stamped IPC envelope.
 
 ## Development
 
