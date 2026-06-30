@@ -31,6 +31,7 @@
 //!   bounded window
 //! - each provider responds with `{"providers": [...]}`
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use astrid_sdk::prelude::*;
@@ -219,7 +220,20 @@ fn discover_providers() -> Vec<ProviderEntry> {
         }
     }
 
-    providers
+    dedupe_providers_by_id(providers)
+}
+
+fn dedupe_providers_by_id(providers: Vec<ProviderEntry>) -> Vec<ProviderEntry> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(providers.len());
+
+    for provider in providers {
+        if seen.insert(provider.id.clone()) {
+            out.push(provider);
+        }
+    }
+
+    out
 }
 
 /// Parse one describe message's `{"providers": [...]}` body and return its
@@ -924,6 +938,58 @@ mod tests {
             context_window: Some(128_000),
             max_output_tokens: Some(8_192),
         }
+    }
+
+    #[test]
+    fn dedupe_providers_by_id_keeps_first_entry_order() {
+        let first = test_entry();
+        let mut duplicate = test_entry();
+        duplicate.description = "duplicate should be dropped".to_string();
+        let mut second = test_entry();
+        second.id = "openai-compat:gpt-4.1".to_string();
+
+        let providers = dedupe_providers_by_id(vec![first.clone(), duplicate, second.clone()]);
+
+        assert_eq!(providers, vec![first, second]);
+    }
+
+    #[test]
+    fn stamped_provider_discovery_duplicates_are_deduped() {
+        let payload = serde_json::json!({
+            "providers": [
+                {
+                    "id": "fake-slow",
+                    "description": "slow",
+                    "request_topic": "llm.v1.request.generate.openai-compat",
+                    "stream_topic": "llm.v1.stream.openai-compat",
+                    "capabilities": ["text"],
+                    "context_window": 128000,
+                    "max_output_tokens": 8192
+                },
+                {
+                    "id": "duplicate-name",
+                    "description": "duplicate",
+                    "request_topic": "llm.v1.request.generate.openai-compat",
+                    "stream_topic": "llm.v1.stream.openai-compat",
+                    "capabilities": ["text"],
+                    "context_window": 128000,
+                    "max_output_tokens": 8192
+                }
+            ]
+        })
+        .to_string();
+
+        let mut providers = Vec::new();
+        providers.extend(stamp_message_providers(&payload, "provider-a"));
+        providers.extend(stamp_message_providers(&payload, "provider-a"));
+
+        let providers = dedupe_providers_by_id(providers);
+        let ids = providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec!["openai-compat:fake-slow", "openai-compat:duplicate-name"]
+        );
     }
 
     /// A `set_active_model` request carrying a `corr_id` must echo that exact
